@@ -96,6 +96,8 @@ extern int	CommitDelay;
 extern int	CommitSiblings;
 extern char *default_tablespace;
 extern char *temp_tablespaces;
+extern char *pgextadv_analyze_sample_export;
+extern char *pgextadv_analyze_sample_import;
 extern bool ignore_checksum_failure;
 extern bool ignore_invalid_pages;
 
@@ -3805,6 +3807,26 @@ struct config_real ConfigureNamesReal[] =
 
 struct config_string ConfigureNamesString[] =
 {
+	{
+		{"pgextadv.analyze_sample_export", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Path for exporting the internal ANALYZE sample."),
+			gettext_noop("An empty path disables sample export; the file is a PostgreSQL-native binary cache."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&pgextadv_analyze_sample_export,
+		"",
+		NULL, NULL, NULL
+	},
+	{
+		{"pgextadv.analyze_sample_import", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Path for importing an internal ANALYZE sample."),
+			gettext_noop("An empty path disables sample import; incompatible or corrupt caches are rejected."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&pgextadv_analyze_sample_import,
+		"",
+		NULL, NULL, NULL
+	},
 	{
 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Sets the shell command that will be called to archive a WAL file."),

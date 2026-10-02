@@ -17,6 +17,7 @@ OBJS = \
 	alter.o \
 	amcmds.o \
 	analyze.o \
+	analyze_sample_cache.o \
 	async.o \
 	cluster.o \
 	collationcmds.o \

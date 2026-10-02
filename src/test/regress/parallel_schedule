@@ -51,6 +51,8 @@ test: create_index create_index_spgist create_view index_including index_includi
 test: create_aggregate create_function_sql create_cast constraints triggers select inherit typed_table vacuum drop_if_exists updatable_views roleattributes create_am hash_func errors infinite_recurse
 
 # ----------
+test: analyze_sample_cache
+
 # sanity_check does a vacuum, affecting the sort order of SELECT *
 # results. So it should not run parallel to other tests.
 # ----------

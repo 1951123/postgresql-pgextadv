@@ -34,6 +34,7 @@
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_statistic_ext.h"
+#include "commands/analyze_sample_cache.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
@@ -81,6 +82,10 @@ typedef struct AnlIndexData
 
 /* Default statistics target (GUC parameter) */
 int			default_statistics_target = 100;
+
+/* Optional binary sample cache controls.  Empty paths keep ANALYZE unchanged. */
+char	   *pgextadv_analyze_sample_export = "";
+char	   *pgextadv_analyze_sample_import = "";
 
 /* A few variables that don't seem worth passing around as parameters */
 static MemoryContext anl_context = NULL;
@@ -1157,6 +1162,36 @@ acquire_sample_rows(Relation onerel, int elevel,
 	BlockSamplerData prefetch_bs;
 #endif
 
+	if ((pgextadv_analyze_sample_import != NULL &&
+		 pgextadv_analyze_sample_import[0] != '\0') &&
+		(pgextadv_analyze_sample_export != NULL &&
+		 pgextadv_analyze_sample_export[0] != '\0'))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pgextadv.analyze_sample_export and pgextadv.analyze_sample_import cannot be enabled together")));
+
+	if (pgextadv_analyze_sample_import != NULL &&
+		pgextadv_analyze_sample_import[0] != '\0')
+	{
+		SampleCache *cache;
+		int			i;
+
+		cache = sample_cache_import(onerel, pgextadv_analyze_sample_import,
+									 targrows);
+		for (i = 0; i < (int) cache->tuple_count; i++)
+			rows[i] = cache->tuples[i];
+		numrows = (int) cache->tuple_count;
+		*totalrows = cache->totalrows;
+		*totaldeadrows = 0.0;
+		cache->tuples = NULL;
+		sample_cache_free(cache, false);
+		ereport(elevel,
+				(errmsg("\"%s\": imported %d rows from ANALYZE sample cache, "
+							"%.0f estimated total rows",
+							RelationGetRelationName(onerel), numrows, *totalrows)));
+		return numrows;
+	}
+
 	Assert(targrows > 0);
 
 	totalblocks = RelationGetNumberOfBlocks(onerel);
@@ -1343,6 +1378,11 @@ acquire_sample_rows(Relation onerel, int elevel,
 					bs.m, totalblocks,
 					liverows, deadrows,
 					numrows, *totalrows)));
+
+	if (pgextadv_analyze_sample_export != NULL &&
+		pgextadv_analyze_sample_export[0] != '\0')
+		sample_cache_export(onerel, pgextadv_analyze_sample_export, rows,
+							 numrows, *totalrows);
 
 	return numrows;
 }
