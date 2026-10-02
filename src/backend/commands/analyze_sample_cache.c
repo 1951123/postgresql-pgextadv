@@ -16,6 +16,7 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "catalog/namespace.h"
 #include "commands/analyze_sample_cache.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
@@ -40,9 +41,9 @@ static void sample_cache_write_string(FILE *file, const char *value,
 								  pg_crc32c *crc, const char *path);
 static char *sample_cache_read_string(FILE *file, pg_crc32c *crc,
 								 const char *path);
-static void sample_cache_check_descriptor(Relation relation,
-										 const char *relation_name,
-										 uint32 natts, FILE *file,
+static char *sample_cache_relation_identity(Relation relation);
+static void sample_cache_check_descriptor(Relation relation, uint32 natts,
+										 FILE *file,
 										 pg_crc32c *crc, const char *path);
 static void sample_cache_file_error(const char *path, const char *operation);
 
@@ -119,9 +120,21 @@ sample_cache_read_string(FILE *file, pg_crc32c *crc, const char *path)
 	return value;
 }
 
+/* Length-prefix both names so dots or other punctuation in identifiers are unambiguous. */
+static char *
+sample_cache_relation_identity(Relation relation)
+{
+	const char *namespace_name = get_namespace_name(RelationGetNamespace(relation));
+	const char *relation_name = RelationGetRelationName(relation);
+
+	return psprintf("%zu:%s%zu:%s",
+					strlen(namespace_name), namespace_name,
+					strlen(relation_name), relation_name);
+}
+
 static void
-sample_cache_check_descriptor(Relation relation, const char *relation_name,
-								  uint32 natts, FILE *file, pg_crc32c *crc,
+sample_cache_check_descriptor(Relation relation, uint32 natts, FILE *file,
+								  pg_crc32c *crc,
 								  const char *path)
 {
 	uint32	 i;
@@ -132,13 +145,6 @@ sample_cache_check_descriptor(Relation relation, const char *relation_name,
 				 errmsg("ANALYZE sample cache column count does not match relation"),
 				 errdetail("cache has %u columns, relation has %d",
 						   natts, relation->rd_att->natts)));
-
-	if (strcmp(RelationGetRelationName(relation), relation_name) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("ANALYZE sample cache relation name does not match"),
-				 errdetail("cache is for \"%s\", relation is \"%s\"",
-						   relation_name, RelationGetRelationName(relation))));
 
 	for (i = 0; i < natts; i++)
 	{
@@ -175,19 +181,21 @@ sample_cache_export(Relation relation, const char *path, HeapTuple *tuples,
 	uint32		natts = (uint32) relation->rd_att->natts;
 	uint32		server_version = PG_VERSION_NUM;
 	const char *server_version_string = PG_VERSION;
+	char	   *relation_identity;
 
 	file = AllocateFile(path, PG_BINARY_W);
 	if (file == NULL)
 		sample_cache_file_error(path, "open");
 
 	INIT_CRC32C(crc);
+	relation_identity = sample_cache_relation_identity(relation);
 	sample_cache_write_bytes(file, SAMPLE_CACHE_MAGIC, SAMPLE_CACHE_MAGIC_LEN,
 							 &crc, path);
 	sample_cache_write_u32(file, SAMPLE_CACHE_FORMAT_VERSION, &crc, path);
 	sample_cache_write_u32(file, server_version, &crc, path);
 	sample_cache_write_string(file, server_version_string, &crc, path);
 	sample_cache_write_u32(file, relation->rd_id, &crc, path);
-	sample_cache_write_string(file, RelationGetRelationName(relation), &crc, path);
+	sample_cache_write_string(file, relation_identity, &crc, path);
 	sample_cache_write_u32(file, natts, &crc, path);
 	sample_cache_write_u32(file, (uint32) tuple_count, &crc, path);
 	sample_cache_write_bytes(file, &totalrows, sizeof(totalrows), &crc, path);
@@ -222,6 +230,7 @@ sample_cache_export(Relation relation, const char *path, HeapTuple *tuples,
 		sample_cache_file_error(path, "write");
 	if (FreeFile(file) != 0)
 		sample_cache_file_error(path, "close");
+	pfree(relation_identity);
 }
 
 SampleCache *
@@ -240,6 +249,7 @@ sample_cache_import(Relation relation, const char *path, int targrows)
 	uint32		natts;
 	uint32		i;
 	int		trailing;
+	char	   *relation_identity;
 
 	file = AllocateFile(path, PG_BINARY_R);
 	if (file == NULL)
@@ -272,12 +282,16 @@ sample_cache_import(Relation relation, const char *path, int targrows)
 
 	relation_oid = sample_cache_read_u32(file, &crc, path);
 	relation_name = sample_cache_read_string(file, &crc, path);
-	if (relation_oid != RelationGetRelid(relation))
+	relation_identity = sample_cache_relation_identity(relation);
+	if (strcmp(relation_name, relation_identity) != 0 &&
+		!(relation_oid == RelationGetRelid(relation) &&
+		  strcmp(relation_name, RelationGetRelationName(relation)) == 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("ANALYZE sample cache relation identifier does not match"),
-				 errdetail("cache is for relation %u, analyzed relation is %u",
-						   relation_oid, RelationGetRelid(relation))));
+				 errmsg("ANALYZE sample cache relation identity does not match"),
+				 errdetail("cache identity \"%s\" does not match relation \"%s\"",
+						   relation_name, relation_identity)));
+	pfree(relation_identity);
 
 	natts = sample_cache_read_u32(file, &crc, path);
 	cache = (SampleCache *) palloc0(sizeof(SampleCache));
@@ -296,7 +310,7 @@ sample_cache_import(Relation relation, const char *path, int targrows)
 				 errdetail("cache has %u rows, ANALYZE requested at most %d",
 						   cache->tuple_count, targrows)));
 
-	sample_cache_check_descriptor(relation, relation_name, natts, file, &crc, path);
+	sample_cache_check_descriptor(relation, natts, file, &crc, path);
 	cache->tuples = (HeapTuple *) palloc(sizeof(HeapTuple) * cache->tuple_count);
 	for (i = 0; i < cache->tuple_count; i++)
 	{
