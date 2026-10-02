@@ -136,6 +136,9 @@ test: compression compression_pglz
 # oidjoins is read-only, though, and should run late for best coverage
 test: event_trigger oidjoins
 
+# Catalogless hypothetical extended statistics are backend-local.
+test: catalogless_hypothetical
+
 # this test also uses event triggers, so likewise run it by itself
 test: fast_default
 

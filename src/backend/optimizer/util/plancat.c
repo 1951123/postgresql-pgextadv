@@ -75,6 +75,7 @@ static List *get_relation_constraints(PlannerInfo *root,
 static List *build_index_tlist(PlannerInfo *root, IndexOptInfo *index,
 							   Relation heapRelation);
 static List *get_relation_statistics(RelOptInfo *rel, Relation relation);
+static List *append_stat_info(List *list, StatisticExtInfo *info);
 static void set_relation_partition_info(PlannerInfo *root, RelOptInfo *rel,
 										Relation relation);
 static PartitionScheme find_partition_scheme(PlannerInfo *root,
@@ -1471,6 +1472,12 @@ get_relation_statistics_worker(List **stainfos, RelOptInfo *rel,
 	ReleaseSysCache(dtup);
 }
 
+static List *
+append_stat_info(List *list, StatisticExtInfo *info)
+{
+	return lappend(list, info);
+}
+
 /*
  * get_relation_statistics
  *		Retrieve extended statistics defined on the table.
@@ -1493,11 +1500,33 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 	foreach(l, statoidlist)
 	{
 		Oid			statOid = lfirst_oid(l);
+		char		virtual_kind;
+		Bitmapset  *virtual_keys = NULL;
 		Form_pg_statistic_ext staForm;
 		HeapTuple	htup;
 		Bitmapset  *keys = NULL;
 		List	   *exprs = NIL;
 		int			i;
+
+		/* Catalogless hypothetical definitions already carry their planner
+		 * metadata.  Do not resolve their synthetic identity through
+		 * pg_statistic_ext. */
+		if (hypothetical_extstats_definition(statOid,
+											RelationGetRelid(relation),
+											&virtual_kind, &virtual_keys))
+		{
+			StatisticExtInfo *info = makeNode(StatisticExtInfo);
+
+			info->statOid = statOid;
+			info->inherit = false;
+			info->rel = rel;
+			info->kind = virtual_kind == HYPOTHETICAL_EXTSTATS_MCV ?
+				STATS_EXT_MCV : STATS_EXT_DEPENDENCIES;
+			info->keys = virtual_keys;
+			info->exprs = NIL;
+			stainfos = append_stat_info(stainfos, info);
+			continue;
+		}
 
 		htup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statOid));
 		if (!HeapTupleIsValid(htup))

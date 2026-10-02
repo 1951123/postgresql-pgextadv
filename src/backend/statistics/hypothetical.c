@@ -1,18 +1,29 @@
 /* Backend-local hypothetical extended-statistics overlay. */
 #include "postgres.h"
 #include "catalog/pg_statistic_ext.h"
+#include "common/hashfn.h"
 #include "fmgr.h"
 #include "access/htup_details.h"
+#include "nodes/bitmapset.h"
 #include "statistics/extended_stats_internal.h"
 #include "statistics/hypothetical.h"
 #include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
 typedef struct HypoPayloadKey { Oid statoid; char kind; } HypoPayloadKey;
 typedef struct HypoPayloadEntry
-{ HypoPayloadKey key; Oid relid; bytea *payload; bool absent_native; } HypoPayloadEntry;
+{
+	HypoPayloadKey key;
+	Oid relid;
+	bytea *payload;
+	Bitmapset *keys;
+	char *candidate_id;
+	bool absent_native;
+	bool virtual_definition;
+} HypoPayloadEntry;
 typedef struct HypoActiveEntry { Oid statoid; Oid relid; } HypoActiveEntry;
 
 static MemoryContext HypoContext;
@@ -54,22 +65,41 @@ hypothetical_extstats_reset(void)
 	HypoEnabled = false;
 }
 
+static HypoPayloadEntry *
+repository_entry(Oid statoid, HypotheticalExtStatsKind kind)
+{
+	HypoPayloadKey key;
+
+	if (HypoRepository == NULL)
+		return NULL;
+	MemSet(&key, 0, sizeof(key));
+	key.statoid = statoid;
+	key.kind = kind;
+	return hash_search(HypoRepository, &key, HASH_FIND, NULL);
+}
+
+static HypoPayloadEntry *
+repository_entry_any(Oid statoid)
+{
+	HypoPayloadEntry *entry;
+
+	entry = repository_entry(statoid, HYPOTHETICAL_EXTSTATS_MCV);
+	if (entry == NULL)
+		entry = repository_entry(statoid, HYPOTHETICAL_EXTSTATS_DEPENDENCIES);
+	return entry;
+}
+
+static bool
+active_oid(Oid statoid)
+{
+	return HypoEnabled && HypoActive != NULL &&
+		hash_search(HypoActive, &statoid, HASH_FIND, NULL) != NULL;
+}
+
 static bool
 repository_oid(Oid statoid, Oid *relid)
 {
-	HypoPayloadKey key;
-	HypoPayloadEntry *entry;
-	if (HypoRepository == NULL)
-		return false;
-	MemSet(&key, 0, sizeof(key));
-	key.statoid = statoid;
-	key.kind = HYPOTHETICAL_EXTSTATS_MCV;
-	entry = hash_search(HypoRepository, &key, HASH_FIND, NULL);
-	if (entry == NULL)
-	{
-		key.kind = HYPOTHETICAL_EXTSTATS_DEPENDENCIES;
-		entry = hash_search(HypoRepository, &key, HASH_FIND, NULL);
-	}
+	HypoPayloadEntry *entry = repository_entry_any(statoid);
 	if (entry == NULL)
 		return false;
 	*relid = entry->relid;
@@ -79,15 +109,10 @@ repository_oid(Oid statoid, Oid *relid)
 bool
 hypothetical_extstats_absent_native(Oid statoid, HypotheticalExtStatsKind kind)
 {
-	HypoPayloadKey key;
 	HypoPayloadEntry *entry;
-	if (!HypoEnabled || HypoActive == NULL ||
-		hash_search(HypoActive, &statoid, HASH_FIND, NULL) == NULL)
+	if (!active_oid(statoid))
 		return false;
-	MemSet(&key, 0, sizeof(key));
-	key.statoid = statoid;
-	key.kind = kind;
-	entry = hash_search(HypoRepository, &key, HASH_FIND, NULL);
+	entry = repository_entry(statoid, kind);
 	if (entry == NULL)
 		ereport(ERROR, (errmsg("active statistics object %u has no registered payload for kind %c",
 			statoid, kind)));
@@ -97,18 +122,156 @@ hypothetical_extstats_absent_native(Oid statoid, HypotheticalExtStatsKind kind)
 bool
 hypothetical_extstats_registered(Oid statoid, HypotheticalExtStatsKind kind)
 {
-	HypoPayloadKey key;
+	HypoPayloadEntry *entry;
 
-	if (!HypoEnabled || HypoActive == NULL || HypoRepository == NULL ||
-		hash_search(HypoActive, &statoid, HASH_FIND, NULL) == NULL)
+	if (!active_oid(statoid))
 		return false;
+	entry = repository_entry(statoid, kind);
+	return entry != NULL && !entry->absent_native;
+}
+
+bool
+hypothetical_extstats_definition(Oid statoid, Oid relid, char *kind,
+								 Bitmapset **keys)
+{
+	HypoPayloadEntry *entry = repository_entry_any(statoid);
+
+	if (entry == NULL || !entry->virtual_definition || entry->relid != relid ||
+		!active_oid(statoid) || entry->absent_native)
+		return false;
+	*kind = entry->key.kind;
+	*keys = bms_copy(entry->keys);
+	return true;
+}
+
+static void
+validate_kind(HypotheticalExtStatsKind kind)
+{
+	if (kind != HYPOTHETICAL_EXTSTATS_MCV &&
+		kind != HYPOTHETICAL_EXTSTATS_DEPENDENCIES)
+		ereport(ERROR, (errmsg("unsupported hypothetical statistics kind: %c", kind)));
+}
+
+static Oid
+allocate_virtual_oid(const char *candidate_id, Oid relid,
+					 HypotheticalExtStatsKind kind)
+{
+	char identity[256];
+	uint32 hash;
+	Oid statoid;
+
+	snprintf(identity, sizeof(identity), "%u:%c:%s", relid, kind, candidate_id);
+	hash = DatumGetUInt32(hash_any((const unsigned char *) identity,
+									 strlen(identity)));
+	/* OID zero is InvalidOid; the high bit marks backend-local values. */
+	statoid = (Oid) (hash | 0x80000000U);
+	if (!OidIsValid(statoid))
+		statoid = FirstNormalObjectId;
+
+	for (;; statoid++)
+	{
+		HeapTuple tuple;
+
+		if (statoid == InvalidOid)
+			continue;
+		if (repository_entry_any(statoid) != NULL)
+			continue;
+		/* This lookup is collision hygiene only.  Planner resolution of a
+		 * virtual identity never consults pg_statistic_ext. */
+		tuple = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statoid));
+		if (!HeapTupleIsValid(tuple))
+			return statoid;
+		ReleaseSysCache(tuple);
+	}
+}
+
+static Bitmapset *
+keys_from_array(ArrayType *array)
+{
+	Datum *datums;
+	bool *nulls;
+	int count;
+	Bitmapset *keys = NULL;
+	int i;
+
+	deconstruct_array_builtin(array, INT2OID, &datums, &nulls, &count);
+	if (count < 2 || count > STATS_MAX_DIMENSIONS)
+		ereport(ERROR, (errmsg("hypothetical statistics require 2..%d attribute keys",
+						  STATS_MAX_DIMENSIONS)));
+	for (i = 0; i < count; i++)
+	{
+		AttrNumber attnum;
+
+		if (nulls[i])
+			ereport(ERROR, (errmsg("hypothetical attribute keys cannot contain NULL")));
+		attnum = DatumGetInt16(datums[i]);
+		if (attnum <= 0 || bms_is_member(attnum, keys))
+			ereport(ERROR, (errmsg("hypothetical attribute keys must be positive and unique")));
+		keys = bms_add_member(keys, attnum);
+	}
+	pfree(datums);
+	pfree(nulls);
+	return keys;
+}
+
+static Oid
+register_definition_internal(const char *candidate_id, Oid relid,
+							 HypotheticalExtStatsKind kind, Bitmapset *keys,
+							 const bytea *payload, bool absent_native)
+{
+	HypoPayloadKey key;
+	HypoPayloadEntry *entry;
+	MemoryContext oldcontext;
+	bool found;
+	Oid statoid;
+	void *decoded = NULL;
+
+	if (candidate_id == NULL || candidate_id[0] == '\0' || !OidIsValid(relid))
+		ereport(ERROR, (errmsg("invalid catalogless hypothetical definition")));
+	validate_kind(kind);
+	if (keys == NULL || bms_num_members(keys) < 2)
+		ereport(ERROR, (errmsg("catalogless hypothetical definition has no attribute keys")));
+	if (!absent_native)
+	{
+		if (payload == NULL || VARSIZE_ANY_EXHDR(payload) == 0)
+			ereport(ERROR, (errmsg("empty hypothetical statistics payload")));
+		if (kind == HYPOTHETICAL_EXTSTATS_MCV)
+			decoded = statext_mcv_deserialize((bytea *) payload);
+		else
+			decoded = statext_dependencies_deserialize((bytea *) payload);
+		pfree(decoded);
+	}
+	hypothetical_extstats_init();
+	statoid = allocate_virtual_oid(candidate_id, relid, kind);
 	MemSet(&key, 0, sizeof(key));
 	key.statoid = statoid;
 	key.kind = kind;
-	{
-		HypoPayloadEntry *entry = hash_search(HypoRepository, &key, HASH_FIND, NULL);
-		return entry != NULL && !entry->absent_native;
-	}
+	entry = hash_search(HypoRepository, &key, HASH_ENTER, &found);
+	Assert(!found);
+	oldcontext = MemoryContextSwitchTo(HypoRepositoryContext);
+	entry->relid = relid;
+	entry->keys = bms_copy(keys);
+	entry->candidate_id = pstrdup(candidate_id);
+	entry->payload = payload ? PG_DETOAST_DATUM_COPY(PointerGetDatum(payload)) : NULL;
+	entry->absent_native = absent_native;
+	entry->virtual_definition = true;
+	MemoryContextSwitchTo(oldcontext);
+	return statoid;
+}
+
+Oid
+hypothetical_extstats_register_definition(const char *candidate_id, Oid relid,
+							 HypotheticalExtStatsKind kind, Bitmapset *keys,
+							 const bytea *payload)
+{
+	return register_definition_internal(candidate_id, relid, kind, keys, payload, false);
+}
+
+Oid
+hypothetical_extstats_register_definition_absent(const char *candidate_id, Oid relid,
+											 HypotheticalExtStatsKind kind, Bitmapset *keys)
+{
+	return register_definition_internal(candidate_id, relid, kind, keys, NULL, true);
 }
 
 void
@@ -155,7 +318,10 @@ hypothetical_extstats_register(Oid statoid, Oid relid,
 	oldcontext = MemoryContextSwitchTo(HypoRepositoryContext);
 	entry->relid = relid;
 	entry->payload = PG_DETOAST_DATUM_COPY(PointerGetDatum(payload));
+	entry->keys = NULL;
+	entry->candidate_id = NULL;
 	entry->absent_native = false;
+	entry->virtual_definition = false;
 	MemoryContextSwitchTo(oldcontext);
 }
 
@@ -192,7 +358,10 @@ hypothetical_extstats_register_absent(Oid statoid, Oid relid,
 			statoid, kind)));
 	entry->relid = relid;
 	entry->payload = NULL;
+	entry->keys = NULL;
+	entry->candidate_id = NULL;
 	entry->absent_native = true;
+	entry->virtual_definition = false;
 }
 
 void
@@ -211,7 +380,7 @@ hypothetical_extstats_activate(List *ordered_oids)
 	foreach(lc, ordered_oids)
 	{
 		Oid oid = lfirst_oid(lc);
-		Oid relid;
+		Oid relid = InvalidOid;
 		ListCell *prior;
 		if (!repository_oid(oid, &relid))
 			ereport(ERROR, (errmsg("cannot activate unregistered statistics object %u", oid)));
@@ -236,7 +405,7 @@ hypothetical_extstats_activate(List *ordered_oids)
 	foreach(lc, ordered_oids)
 	{
 		Oid oid = lfirst_oid(lc);
-		Oid relid;
+		Oid relid = InvalidOid;
 		HypoActiveEntry *active;
 		bool found;
 		(void) repository_oid(oid, &relid);
@@ -260,22 +429,31 @@ hypothetical_extstats_filter(Oid relid, List *catalog_oids)
 {
 	List *result = NIL;
 	ListCell *lc;
+	HASH_SEQ_STATUS status;
+	HypoPayloadEntry *entry;
 	int i;
 	bool targeted = false;
 	if (!HypoEnabled)
 		return catalog_oids;
-	foreach(lc, catalog_oids)
+	hash_seq_init(&status, HypoRepository);
+	while ((entry = hash_seq_search(&status)) != NULL)
 	{
-		Oid registered_relid;
-		if (repository_oid(lfirst_oid(lc), &registered_relid) && registered_relid == relid)
+		if (entry->relid == relid)
+		{
 			targeted = true;
+			hash_seq_term(&status);
+			break;
+		}
 	}
 	if (!targeted)
 		return catalog_oids;
 	for (i = 0; i < HypoOrderLength; i++)
 	{
 		HypoActiveEntry *active = hash_search(HypoActive, &HypoOrder[i], HASH_FIND, NULL);
-		if (active->relid == relid && list_member_oid(catalog_oids, HypoOrder[i]))
+		HypoPayloadEntry *definition = repository_entry_any(HypoOrder[i]);
+		if (active->relid == relid && definition != NULL &&
+			!definition->absent_native &&
+			(definition->virtual_definition || list_member_oid(catalog_oids, HypoOrder[i])))
 			result = lappend_oid(result, HypoOrder[i]);
 	}
 	foreach(lc, catalog_oids)
@@ -304,7 +482,9 @@ hypothetical_extstats_payload(Oid statoid, HypotheticalExtStatsKind kind,
 	entry = hash_search(HypoRepository, &key, HASH_FIND, NULL);
 	if (entry == NULL)
 		ereport(ERROR, (errmsg("active statistics object %u has no registered payload for kind %c",
-			statoid, kind)));
+						  statoid, kind)));
+	if (entry->absent_native)
+		return false;
 	*payload = entry->payload;
 	return true;
 }
@@ -324,6 +504,31 @@ Datum pg_hypothetical_extstats_register_absent(PG_FUNCTION_ARGS)
 	hypothetical_extstats_register_absent(PG_GETARG_OID(0), PG_GETARG_OID(1),
 			(HypotheticalExtStatsKind) PG_GETARG_CHAR(2));
 	PG_RETURN_VOID();
+}
+
+Datum pg_hypothetical_extstats_register_definition(PG_FUNCTION_ARGS)
+{
+	text *candidate = PG_GETARG_TEXT_PP(0);
+	ArrayType *array = PG_GETARG_ARRAYTYPE_P(3);
+	Bitmapset *keys = keys_from_array(array);
+	Oid statoid = hypothetical_extstats_register_definition(
+			text_to_cstring(candidate), PG_GETARG_OID(1),
+			(HypotheticalExtStatsKind) PG_GETARG_CHAR(2), keys,
+			PG_GETARG_BYTEA_PP(4));
+	bms_free(keys);
+	PG_RETURN_OID(statoid);
+}
+
+Datum pg_hypothetical_extstats_register_definition_absent(PG_FUNCTION_ARGS)
+{
+	text *candidate = PG_GETARG_TEXT_PP(0);
+	ArrayType *array = PG_GETARG_ARRAYTYPE_P(3);
+	Bitmapset *keys = keys_from_array(array);
+	Oid statoid = hypothetical_extstats_register_definition_absent(
+			text_to_cstring(candidate), PG_GETARG_OID(1),
+			(HypotheticalExtStatsKind) PG_GETARG_CHAR(2), keys);
+	bms_free(keys);
+	PG_RETURN_OID(statoid);
 }
 
 Datum pg_hypothetical_extstats_activate(PG_FUNCTION_ARGS)
