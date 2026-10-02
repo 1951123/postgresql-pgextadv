@@ -96,6 +96,9 @@ extern int	CommitDelay;
 extern int	CommitSiblings;
 extern char *default_tablespace;
 extern char *temp_tablespaces;
+extern char *pg_extstats_frozen_sample_mode;
+extern char *pg_extstats_frozen_sample_relation;
+extern double pg_extstats_frozen_totalrows;
 extern char *pgextadv_analyze_sample_export;
 extern char *pgextadv_analyze_sample_import;
 extern bool ignore_checksum_failure;
@@ -3527,6 +3530,16 @@ struct config_int ConfigureNamesInt[] =
 struct config_real ConfigureNamesReal[] =
 {
 	{
+		{"pg_extstats.frozen_totalrows", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Original relation cardinality used by frozen-sample ANALYZE replay."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&pg_extstats_frozen_totalrows,
+		-1.0, -1.0, DBL_MAX,
+		NULL, NULL, NULL
+	},
+	{
 		{"seq_page_cost", PGC_USERSET, QUERY_TUNING_COST,
 			gettext_noop("Sets the planner's estimate of the cost of a "
 						 "sequentially fetched disk page."),
@@ -3807,6 +3820,26 @@ struct config_real ConfigureNamesReal[] =
 
 struct config_string ConfigureNamesString[] =
 {
+	{
+		{"pg_extstats.frozen_sample_mode", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Use an experiment-only frozen acquisition sample during ANALYZE."),
+			gettext_noop("The default off mode preserves normal PostgreSQL sampling; capture and replay are fail-closed modes."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&pg_extstats_frozen_sample_mode,
+		"off",
+		NULL, NULL, NULL
+	},
+	{
+		{"pg_extstats.frozen_sample_relation", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Auxiliary relation containing an exact frozen ANALYZE sample."),
+			NULL,
+		GUC_NOT_IN_SAMPLE
+		},
+		&pg_extstats_frozen_sample_relation,
+		"",
+		NULL, NULL, NULL
+	},
 	{
 		{"pgextadv.analyze_sample_export", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Path for exporting the internal ANALYZE sample."),

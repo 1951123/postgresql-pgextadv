@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	dependencies.o \
 	extended_stats.o \
+	hypothetical.o \
 	mcv.o \
 	mvdistinct.o
 

@@ -46,6 +46,7 @@
 #include "partitioning/partdesc.h"
 #include "rewrite/rewriteManip.h"
 #include "statistics/statistics.h"
+#include "statistics/hypothetical.h"
 #include "storage/bufmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -1371,7 +1372,42 @@ get_relation_statistics_worker(List **stainfos, RelOptInfo *rel,
 	dtup = SearchSysCache2(STATEXTDATASTXOID,
 						   ObjectIdGetDatum(statOid), BoolGetDatum(inh));
 	if (!HeapTupleIsValid(dtup))
+	{
+		/*
+		 * A hypothetical realization may intentionally have no physical
+		 * pg_statistic_ext_data row.  Treat only registered PRESENT kinds
+		 * as built; ordinary PostgreSQL definitions still produce no info.
+		 */
+		if (hypothetical_extstats_registered(statOid,
+										 HYPOTHETICAL_EXTSTATS_DEPENDENCIES))
+		{
+			StatisticExtInfo *info = makeNode(StatisticExtInfo);
+
+			info->statOid = statOid;
+			info->inherit = inh;
+			info->rel = rel;
+			info->kind = STATS_EXT_DEPENDENCIES;
+			info->keys = bms_copy(keys);
+			info->exprs = exprs;
+			*stainfos = lappend(*stainfos, info);
+		}
+
+		if (hypothetical_extstats_registered(statOid,
+										 HYPOTHETICAL_EXTSTATS_MCV))
+		{
+			StatisticExtInfo *info = makeNode(StatisticExtInfo);
+
+			info->statOid = statOid;
+			info->inherit = inh;
+			info->rel = rel;
+			info->kind = STATS_EXT_MCV;
+			info->keys = bms_copy(keys);
+			info->exprs = exprs;
+			*stainfos = lappend(*stainfos, info);
+		}
+
 		return;
+	}
 
 	dataForm = (Form_pg_statistic_ext_data) GETSTRUCT(dtup);
 
@@ -1452,6 +1488,7 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 	ListCell   *l;
 
 	statoidlist = RelationGetStatExtList(relation);
+	statoidlist = hypothetical_extstats_filter(RelationGetRelid(relation), statoidlist);
 
 	foreach(l, statoidlist)
 	{

@@ -25,6 +25,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "statistics/extended_stats_internal.h"
+#include "statistics/hypothetical.h"
 #include "statistics/statistics.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -562,9 +563,20 @@ MCVList *
 statext_mcv_load(Oid mvoid, bool inh)
 {
 	MCVList    *result;
+	const bytea *hypothetical;
 	bool		isnull;
 	Datum		mcvlist;
-	HeapTuple	htup = SearchSysCache2(STATEXTDATASTXOID,
+	HeapTuple	htup;
+
+	if (!inh && hypothetical_extstats_payload(mvoid, HYPOTHETICAL_EXTSTATS_MCV,
+											 &hypothetical))
+		return statext_mcv_deserialize((bytea *) hypothetical);
+
+	if (!inh && hypothetical_extstats_absent_native(mvoid,
+											 HYPOTHETICAL_EXTSTATS_MCV))
+		return NULL;
+
+	htup = SearchSysCache2(STATEXTDATASTXOID,
 									   ObjectIdGetDatum(mvoid), BoolGetDatum(inh));
 
 	if (!HeapTupleIsValid(htup))

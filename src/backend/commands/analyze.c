@@ -18,6 +18,7 @@
 
 #include "access/detoast.h"
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/relation.h"
 #include "access/sysattr.h"
@@ -30,6 +31,7 @@
 #include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
@@ -63,11 +65,14 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/regproc.h"
+#include "utils/snapmgr.h"
 #include "utils/sampling.h"
 #include "utils/sortsupport.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 
 
 /* Per-index data for ANALYZE */
@@ -82,6 +87,16 @@ typedef struct AnlIndexData
 
 /* Default statistics target (GUC parameter) */
 int			default_statistics_target = 100;
+
+/*
+ * Experiment-only frozen-sample controls.  The normal ANALYZE path remains
+ * unchanged while mode is "off".  Capture stores the native reservoir in an
+ * auxiliary relation; replay reads that exact relation and bypasses heap
+ * sampling entirely.
+ */
+char	   *pg_extstats_frozen_sample_mode = "off";
+char	   *pg_extstats_frozen_sample_relation = "";
+double		pg_extstats_frozen_totalrows = -1.0;
 
 /* Optional binary sample cache controls.  Empty paths keep ANALYZE unchanged. */
 char	   *pgextadv_analyze_sample_export = "";
@@ -105,6 +120,11 @@ static VacAttrStats *examine_attribute(Relation onerel, int attnum,
 static int	acquire_sample_rows(Relation onerel, int elevel,
 								HeapTuple *rows, int targrows,
 								double *totalrows, double *totaldeadrows);
+static int	acquire_frozen_sample_rows(Relation onerel, int elevel,
+								 HeapTuple *rows, int targrows,
+								 double *totalrows, double *totaldeadrows);
+static void capture_frozen_sample_rows(Relation onerel, HeapTuple *rows,
+									   int numrows);
 static int	compare_rows(const void *a, const void *b, void *arg);
 static int	acquire_inherited_sample_rows(Relation onerel, int elevel,
 										  HeapTuple *rows, int targrows,
@@ -1187,10 +1207,23 @@ acquire_sample_rows(Relation onerel, int elevel,
 		sample_cache_free(cache, false);
 		ereport(elevel,
 				(errmsg("\"%s\": imported %d rows from ANALYZE sample cache, "
-							"%.0f estimated total rows",
-							RelationGetRelationName(onerel), numrows, *totalrows)));
+						"%.0f estimated total rows",
+						RelationGetRelationName(onerel), numrows, *totalrows)));
 		return numrows;
 	}
+
+	if (pg_extstats_frozen_sample_mode != NULL &&
+		strcmp(pg_extstats_frozen_sample_mode, "replay") == 0)
+		return acquire_frozen_sample_rows(onerel, elevel, rows, targrows,
+									  totalrows, totaldeadrows);
+	if (pg_extstats_frozen_sample_mode != NULL &&
+		pg_extstats_frozen_sample_mode[0] != '\0' &&
+		strcmp(pg_extstats_frozen_sample_mode, "off") != 0 &&
+		strcmp(pg_extstats_frozen_sample_mode, "capture") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid pg_extstats.frozen_sample_mode: \"%s\"",
+						pg_extstats_frozen_sample_mode)));
 
 	Assert(targrows > 0);
 
@@ -1379,12 +1412,158 @@ acquire_sample_rows(Relation onerel, int elevel,
 					liverows, deadrows,
 					numrows, *totalrows)));
 
+	if (pg_extstats_frozen_sample_mode != NULL &&
+		strcmp(pg_extstats_frozen_sample_mode, "capture") == 0)
+		capture_frozen_sample_rows(onerel, rows, numrows);
+
 	if (pgextadv_analyze_sample_export != NULL &&
 		pgextadv_analyze_sample_export[0] != '\0')
 		sample_cache_export(onerel, pgextadv_analyze_sample_export, rows,
 							 numrows, *totalrows);
 
 	return numrows;
+}
+
+/*
+ * Read an exact, persisted acquisition sample.  This deliberately does not
+ * call any table sampling API: the auxiliary relation is scanned
+ * sequentially and its tuples are copied directly into ANALYZE's shared
+ * sample array, which is then consumed by both ordinary and extended stats
+ * builders.
+ */
+static int
+acquire_frozen_sample_rows(Relation onerel, int elevel,
+						   HeapTuple *rows, int targrows,
+						   double *totalrows, double *totaldeadrows)
+{
+	List		*names;
+	RangeVar   *rv;
+	Relation	sample_rel;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	int			numrows = 0;
+	int			i;
+
+	if (pg_extstats_frozen_sample_relation == NULL ||
+		pg_extstats_frozen_sample_relation[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("frozen sample replay requires pg_extstats.frozen_sample_relation")));
+
+	names = stringToQualifiedNameList(pg_extstats_frozen_sample_relation, NULL);
+	rv = makeRangeVarFromNameList(names);
+	sample_rel = table_openrv(rv, AccessShareLock);
+
+	if (sample_rel->rd_att->natts != onerel->rd_att->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("frozen sample column count does not match analyzed relation")));
+	for (i = 0; i < onerel->rd_att->natts; i++)
+	{
+		Form_pg_attribute expected = TupleDescAttr(onerel->rd_att, i);
+		Form_pg_attribute actual = TupleDescAttr(sample_rel->rd_att, i);
+
+		if (expected->atttypid != actual->atttypid ||
+			expected->atttypmod != actual->atttypmod ||
+			expected->attcollation != actual->attcollation)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("frozen sample column %d type metadata does not match analyzed relation",
+						i + 1)));
+	}
+
+	scan = table_beginscan(sample_rel, GetLatestSnapshot(), 0, NULL);
+	slot = table_slot_create(sample_rel, NULL);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		if (numrows >= targrows)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("frozen sample has more rows than ANALYZE requested"),
+					 errdetail("sample rows exceed target %d", targrows)));
+		rows[numrows++] = ExecCopySlotHeapTuple(slot);
+	}
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	table_close(sample_rel, AccessShareLock);
+
+	if (numrows <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("frozen sample relation is empty")));
+	if (pg_extstats_frozen_totalrows < 0.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("frozen sample replay requires pg_extstats.frozen_totalrows")));
+
+	*totalrows = pg_extstats_frozen_totalrows;
+	*totaldeadrows = 0.0;
+	ereport(elevel,
+			(errmsg("frozen sample replay: %d rows, %.0f estimated total rows",
+					numrows, *totalrows)));
+	return numrows;
+}
+
+/* Persist the native reservoir in deterministic physical insertion order. */
+static void
+capture_frozen_sample_rows(Relation onerel, HeapTuple *rows, int numrows)
+{
+	List		*names;
+	RangeVar   *rv;
+	Relation	sample_rel;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	int			existing = 0;
+	int			i;
+
+	if (pg_extstats_frozen_sample_relation == NULL ||
+		pg_extstats_frozen_sample_relation[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("frozen sample capture requires pg_extstats.frozen_sample_relation")));
+
+	names = stringToQualifiedNameList(pg_extstats_frozen_sample_relation, NULL);
+	rv = makeRangeVarFromNameList(names);
+	sample_rel = table_openrv(rv, RowExclusiveLock);
+	if (sample_rel->rd_att->natts != onerel->rd_att->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("frozen sample column count does not match analyzed relation")));
+	for (i = 0; i < onerel->rd_att->natts; i++)
+	{
+		Form_pg_attribute expected = TupleDescAttr(onerel->rd_att, i);
+		Form_pg_attribute actual = TupleDescAttr(sample_rel->rd_att, i);
+
+		if (expected->atttypid != actual->atttypid ||
+			expected->atttypmod != actual->atttypmod ||
+			expected->attcollation != actual->attcollation)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("frozen sample column %d type metadata does not match analyzed relation",
+						i + 1)));
+	}
+
+	scan = table_beginscan(sample_rel, GetLatestSnapshot(), 0, NULL);
+	slot = table_slot_create(sample_rel, NULL);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		existing++;
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	if (existing != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("frozen sample capture relation is not empty"),
+				 errdetail("found %d existing rows", existing)));
+
+	for (i = 0; i < numrows; i++)
+	{
+		HeapTuple copy = heap_copytuple(rows[i]);
+
+		heap_insert(sample_rel, copy, GetCurrentCommandId(true), 0, NULL);
+		heap_freetuple(copy);
+	}
+	CommandCounterIncrement();
+	table_close(sample_rel, RowExclusiveLock);
 }
 
 /*

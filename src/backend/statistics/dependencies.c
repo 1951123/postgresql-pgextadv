@@ -26,6 +26,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "statistics/extended_stats_internal.h"
+#include "statistics/hypothetical.h"
 #include "statistics/statistics.h"
 #include "utils/bytea.h"
 #include "utils/fmgroids.h"
@@ -621,9 +622,19 @@ MVDependencies *
 statext_dependencies_load(Oid mvoid, bool inh)
 {
 	MVDependencies *result;
+	const bytea *hypothetical;
 	bool		isnull;
 	Datum		deps;
 	HeapTuple	htup;
+
+	if (!inh && hypothetical_extstats_payload(mvoid,
+											 HYPOTHETICAL_EXTSTATS_DEPENDENCIES,
+											 &hypothetical))
+		return statext_dependencies_deserialize((bytea *) hypothetical);
+
+	if (!inh && hypothetical_extstats_absent_native(mvoid,
+											 HYPOTHETICAL_EXTSTATS_DEPENDENCIES))
+		return NULL;
 
 	htup = SearchSysCache2(STATEXTDATASTXOID,
 						   ObjectIdGetDatum(mvoid),

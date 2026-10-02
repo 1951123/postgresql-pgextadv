@@ -12043,4 +12043,26 @@
   proname => 'any_value_transfn', prorettype => 'anyelement',
   proargtypes => 'anyelement anyelement', prosrc => 'any_value_transfn' },
 
+# Backend-local hypothetical extended-statistics test/control surface.
+{ oid => '9995', descr => 'reset backend-local hypothetical extended statistics',
+  proname => 'pg_hypothetical_extstats_reset', provolatile => 'v',
+  prorettype => 'void', proargtypes => '',
+  prosrc => 'pg_hypothetical_extstats_reset' },
+{ oid => '9996', descr => 'register a native hypothetical statistics payload',
+  proname => 'pg_hypothetical_extstats_register', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'oid oid char bytea',
+  prosrc => 'pg_hypothetical_extstats_register' },
+{ oid => '9999', descr => 'register an absent native hypothetical statistics realization',
+  proname => 'pg_hypothetical_extstats_register_absent', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'oid oid char',
+  prosrc => 'pg_hypothetical_extstats_register_absent' },
+{ oid => '9997', descr => 'activate an ordered hypothetical statistics design',
+  proname => 'pg_hypothetical_extstats_activate', provolatile => 'v',
+  prorettype => 'void', proargtypes => '_oid',
+  prosrc => 'pg_hypothetical_extstats_activate' },
+{ oid => '9998', descr => 'inspect the active hypothetical statistics design',
+  proname => 'pg_hypothetical_extstats_active', provolatile => 'v',
+  prorettype => '_oid', proargtypes => '',
+  prosrc => 'pg_hypothetical_extstats_active' },
+
 ]
