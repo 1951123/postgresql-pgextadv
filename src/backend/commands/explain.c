@@ -15,6 +15,7 @@
 
 #include "access/xact.h"
 #include "catalog/pg_type.h"
+#include "common/shortest_dec.h"
 #include "commands/createas.h"
 #include "commands/defrem.h"
 #include "commands/prepare.h"
@@ -67,6 +68,8 @@ static bool ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used);
 static void ExplainNode(PlanState *planstate, List *ancestors,
 						const char *relationship, const char *plan_name,
 						ExplainState *es);
+static void ExplainPropertyFloatPrecise(const char *qlabel, const char *unit,
+										 double value, ExplainState *es);
 static void show_plan_tlist(PlanState *planstate, List *ancestors,
 							ExplainState *es);
 static void show_expression(Node *node, const char *qlabel,
@@ -1631,6 +1634,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 								 2, es);
 			ExplainPropertyFloat("Plan Rows", NULL, plan->plan_rows,
 								 0, es);
+			if (es->format == EXPLAIN_FORMAT_JSON)
+				ExplainPropertyFloatPrecise("Plan Rows Exact", NULL,
+										plan->plan_rows, es);
 			ExplainPropertyInteger("Plan Width", NULL, plan->plan_width,
 								   es);
 		}
@@ -4595,6 +4601,24 @@ ExplainPropertyFloat(const char *qlabel, const char *unit, double value,
 	buf = psprintf("%.*f", ndigits, value);
 	ExplainProperty(qlabel, unit, buf, true, es);
 	pfree(buf);
+}
+
+/*
+ * Explain a diagnostic double-valued property without losing precision.
+ *
+ * The shortest-decimal representation round-trips to the same double and is
+ * emitted as a JSON number by ExplainProperty.  This helper is intentionally
+ * separate from ExplainPropertyFloat so existing EXPLAIN output contracts do
+ * not change.
+ */
+static void
+ExplainPropertyFloatPrecise(const char *qlabel, const char *unit, double value,
+							ExplainState *es)
+{
+	char		buf[DOUBLE_SHORTEST_DECIMAL_LEN];
+
+	double_to_shortest_decimal_buf(value, buf);
+	ExplainProperty(qlabel, unit, buf, true, es);
 }
 
 /*
