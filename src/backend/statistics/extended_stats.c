@@ -27,6 +27,7 @@
 #include "executor/executor.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
@@ -35,6 +36,7 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "statistics/extended_stats_internal.h"
+#include "statistics/hypothetical.h"
 #include "statistics/statistics.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -84,6 +86,57 @@ static void statext_store(Oid statOid, bool inh,
 						  MCVList *mcv, Datum exprs, VacAttrStats **stats);
 static int	statext_compute_stattarget(int stattarget,
 									   int nattrs, VacAttrStats **stats);
+
+static void
+pgextadv_trace_bitmap(StringInfo output, Bitmapset *bitmap)
+{
+	int member = -1;
+	bool first = true;
+
+	appendStringInfoChar(output, '[');
+	while ((member = bms_next_member(bitmap, member)) >= 0)
+	{
+		if (!first)
+			appendStringInfoChar(output, ',');
+		appendStringInfo(output, "%d", member);
+		first = false;
+	}
+	appendStringInfoChar(output, ']');
+}
+
+static void
+pgextadv_trace_mcv_application(StatisticExtInfo *stat,
+								 int selection_order,
+								 Bitmapset *covered_attnums,
+								 Selectivity simple_sel,
+								 Selectivity mcv_sel,
+								 Selectivity mcv_basesel,
+								 Selectivity mcv_totalsel,
+								 Selectivity stat_sel,
+								 Selectivity cumulative_sel)
+{
+	StringInfoData output;
+
+	if (!pgextadv_mcv_trace)
+		return;
+
+	initStringInfo(&output);
+	appendStringInfoString(&output,
+						   "PGEXTADV_MCV_TRACE {\"event\":\"mcv_application\"");
+	appendStringInfo(&output, ",\"stat_oid\":%u,\"selection_order\":%d",
+						 stat->statOid, selection_order);
+	appendStringInfoString(&output, ",\"stat_keys\":");
+	pgextadv_trace_bitmap(&output, stat->keys);
+	appendStringInfoString(&output, ",\"covered_attnums\":");
+	pgextadv_trace_bitmap(&output, covered_attnums);
+	appendStringInfo(&output,
+					 ",\"simple_sel\":%.17g,\"mcv_sel\":%.17g"
+					 ",\"mcv_basesel\":%.17g,\"mcv_totalsel\":%.17g"
+					 ",\"stat_sel\":%.17g,\"cumulative_sel\":%.17g}",
+					 simple_sel, mcv_sel, mcv_basesel, mcv_totalsel,
+					 stat_sel, cumulative_sel);
+	ereport(NOTICE, (errmsg_internal("%s", output.data)));
+}
 
 /* Information needed to analyze a single simple expression. */
 typedef struct AnlExprData
@@ -1736,6 +1789,7 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 	Bitmapset **list_attnums;	/* attnums extracted from the clause */
 	List	  **list_exprs;		/* expressions matched to any statistic */
 	int			listidx;
+	int			selection_order = 0;
 	Selectivity sel = (is_or) ? 0.0 : 1.0;
 	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 
@@ -1788,6 +1842,7 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 		StatisticExtInfo *stat;
 		List	   *stat_clauses;
 		Bitmapset  *simple_clauses;
+		Bitmapset  *covered_attnums = NULL;
 
 		/* find the best suited statistics object for these attnums */
 		stat = choose_best_statistics(rel->statlist, STATS_EXT_MCV, rte->inh,
@@ -1847,6 +1902,9 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 			 * Now we know the clause is compatible (we have either attnums or
 			 * expressions extracted from it), and was not estimated yet.
 			 */
+			if (pgextadv_mcv_trace)
+				covered_attnums = bms_add_members(covered_attnums,
+												  list_attnums[listidx]);
 
 			/* record simple clauses (single column or expression) */
 			if ((list_attnums[listidx] == NULL &&
@@ -2004,6 +2062,10 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 
 			/* Factor this into the overall result */
 			sel *= stat_sel;
+			if (pgextadv_mcv_trace)
+				pgextadv_trace_mcv_application(stat, selection_order++,
+												   covered_attnums, simple_sel, mcv_sel,
+												   mcv_basesel, mcv_totalsel, stat_sel, sel);
 		}
 	}
 

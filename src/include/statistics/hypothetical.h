@@ -18,6 +18,9 @@ typedef enum HypotheticalExtStatsKind
 	HYPOTHETICAL_EXTSTATS_DEPENDENCIES = 'f'
 } HypotheticalExtStatsKind;
 
+/* Opt-in mechanism trace for the Foundations diagnostic only. */
+extern bool pgextadv_mcv_trace;
+
 /* Reset all repository and active-design state in the current backend. */
 extern void hypothetical_extstats_reset(void);
 

@@ -81,6 +81,7 @@
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeMemoize.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -93,6 +94,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "statistics/hypothetical.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
@@ -5014,18 +5016,35 @@ void
 set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 {
 	double		nrows;
+	double		selectivity;
+	Oid		reloid;
 
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   rel->baserestrictinfo,
-							   0,
-							   JOIN_INNER,
-							   NULL);
+	selectivity = clauselist_selectivity(root,
+											 rel->baserestrictinfo,
+											 0,
+											 JOIN_INNER,
+											 NULL);
+	nrows = rel->tuples * selectivity;
 
 	rel->rows = clamp_row_est(nrows);
+	if (pgextadv_mcv_trace)
+	{
+		StringInfoData output;
+
+		reloid = planner_rt_fetch(rel->relid, root)->relid;
+		initStringInfo(&output);
+		appendStringInfo(&output,
+						 "PGEXTADV_MCV_TRACE {\"event\":\"base_selectivity\"");
+		appendStringInfo(&output,
+						 ",\"relation_oid\":%u,\"tuples\":%.17g"
+						 ",\"selectivity\":%.17g,\"rows_before_clamp\":%.17g"
+						 ",\"rows_after_clamp\":%.17g}",
+						 reloid, rel->tuples, selectivity, nrows, rel->rows);
+		ereport(NOTICE, (errmsg_internal("%s", output.data)));
+	}
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 

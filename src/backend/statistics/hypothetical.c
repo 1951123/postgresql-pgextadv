@@ -9,6 +9,7 @@
 #include "statistics/hypothetical.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -34,6 +35,8 @@ static HTAB *HypoActive;
 static Oid *HypoOrder;
 static int HypoOrderLength;
 static bool HypoEnabled;
+bool pgextadv_mcv_trace = false;
+static bool PgExtAdvMcvTraceGucDefined = false;
 
 static void
 hypothetical_extstats_init(void)
@@ -41,6 +44,21 @@ hypothetical_extstats_init(void)
 	HASHCTL ctl;
 	if (HypoContext != NULL)
 		return;
+	if (!PgExtAdvMcvTraceGucDefined)
+	{
+		DefineCustomBoolVariable("pgextadv.mcv_trace",
+								 "emit opt-in MCV selectivity diagnostics",
+								 "Emit structured NOTICE diagnostics for MCV statistic selection "
+								 "and base-relation selectivity when enabled.",
+								 &pgextadv_mcv_trace,
+								 false,
+								 PGC_USERSET,
+								 0,
+								 NULL,
+								 NULL,
+								 NULL);
+		PgExtAdvMcvTraceGucDefined = true;
+	}
 	HypoContext = AllocSetContextCreate(TopMemoryContext,
 			"HypotheticalExtStatsContext", ALLOCSET_DEFAULT_SIZES);
 	HypoRepositoryContext = AllocSetContextCreate(HypoContext,
